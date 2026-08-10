@@ -33,7 +33,7 @@ def get_model():
     llm = ChatDeepSeek(
         model="deepseek-chat",
         temperature=0.7,
-        max_tokens=100
+        max_tokens=1024
     )
     return llm
 

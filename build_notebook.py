@@ -1107,6 +1107,7 @@ Vừa là A2A Server (nhận yêu cầu từ User) vừa là A2A Client (gọi w
 \"\"\"
 import argparse
 import logging
+import os
 
 import uvicorn
 from fastapi import FastAPI
@@ -1130,6 +1131,9 @@ from a2a.types import (
     AgentProvider,
     AgentSkill,
     Part,
+    Task,
+    TaskState,
+    TaskStatus,
 )
 
 from a2a_common import call_agent, get_model, run_deep_agent
@@ -1172,11 +1176,11 @@ def build_deep_agent():
         model=model,
         tools=[ask_weather, ask_news, ask_currency],
         system_prompt=(
-            "Bạn là đội trưởng điều phối. Quy tắc:\n"
-            "- Hỏi về thời tiết -> gọi ask_weather\n"
-            "- Hỏi về tin tức -> gọi ask_news\n"
-            "- Hỏi về tiền tệ/đổi tiền -> gọi ask_currency\n"
-            "- Yêu cầu phức tạp -> gọi NHIỀU tool và tổng hợp.\n"
+            "Bạn là đội trưởng điều phối. Quy tắc:\\n"
+            "- Hỏi về thời tiết -> gọi ask_weather\\n"
+            "- Hỏi về tin tức -> gọi ask_news\\n"
+            "- Hỏi về tiền tệ/đổi tiền -> gọi ask_currency\\n"
+            "- Yêu cầu phức tạp -> gọi NHIỀU tool và tổng hợp.\\n"
             "Cuối cùng hãy trả lời rõ ràng, thân thiện bằng tiếng Việt."
         ),
     )
@@ -1190,6 +1194,16 @@ class OrchestratorExecutor(AgentExecutor):
         user_input = context.get_user_input()
         task_id = context.task_id
         context_id = context.context_id
+
+        # BẮT BUỘC: gửi Task ban đầu (submitted) TRƯỚC các status update
+        await event_queue.enqueue_event(
+            Task(
+                id=task_id,
+                context_id=context_id,
+                status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+                history=[context.message],
+            )
+        )
 
         updater = TaskUpdater(event_queue, task_id, context_id)
         await updater.start_work(

@@ -1,0 +1,14 @@
+# Secrets / environment variables — never commit these
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
