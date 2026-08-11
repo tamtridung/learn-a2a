@@ -67,50 +67,93 @@ async def run_deep_agent(agent, query, thread_id="thread-1"):
 
 
 
-async def call_agent(base_url, user_text, verbose=True):
+# Tiền tố đánh dấu "worker đang cần người dùng xác nhận (HITL)".
+# Khi call_agent() không được truyền ask_user, nó trả về chuỗi dạng:
+#   "__HITL__::<task_id>|<context_id>|<câu hỏi>"
+# để bên gọi (ví dụ orchestrator) tự quyết định cách hỏi người dùng.
+HITL_PREFIX = "__HITL__::"
+
+
+async def call_agent(base_url, user_text, verbose=True, ask_user=None,
+                     task_id=None, context_id=None):
     """Gọi một A2A server và trả về toàn bộ nội dung trong artifact.
 
     Đây chính là "khách hàng" (A2A Client):
       1. Resolve Agent Card từ URL (đọc "danh thiếp")
-      2. Tạo client
-      3. Gửi SendMessage
-      4. Lắng nghe dòng sự kiện: status update + artifact update
+      2. Gửi SendMessage (truyền task_id/context_id -> gửi TIẾP vào task cũ)
+      3. Lắng nghe dòng sự kiện: status update + artifact update
+      4. Nếu server chuyển sang input-required (HITL):
+         - Có ask_user: gọi ask_user(câu_hỏi) lấy câu trả lời, gửi lại cho
+           CÙNG task, tiếp tục tới khi hoàn thành.
+         - Không có ask_user: trả về "__HITL__::<task_id>|<context_id>|<câu_hỏi>"
+           để bên gọi (orchestrator) tự xử lý việc hỏi người dùng.
     """
     artifacts = []
+    current_text = user_text
+    cur_task_id = task_id
+    cur_context_id = context_id
     async with httpx.AsyncClient() as httpx_client:
         config = ClientConfig(httpx_client=httpx_client)
         client = await create_client(base_url, client_config=config)
-
-        message = Message(
-            role=Role.ROLE_USER,
-            message_id=str(uuid.uuid4()),
-            parts=[Part(text=user_text)],
-        )
-        request = SendMessageRequest(message=message)
-
-        # Duyệt qua từng sự kiện server gửi về (stream).
-        # Truyền ClientCallContext(timeout=...) để tránh ReadTimeout
-        # (mặc định httpx 5s) khi server chạy LLM thật hoặc điều phối nhiều worker.
-        async for event in client.send_message(
-            request, context=ClientCallContext(timeout=300.0)
-        ):
-            if event.HasField("status_update"):
-                state = TaskState.Name(event.status_update.status.state)
-                extra = ""
-                if event.status_update.status.HasField("message"):
-                    extra = get_message_text(
-                        event.status_update.status.message, delimiter=" "
-                    )
-                if verbose:
-                    print(f"      [status] {state} {extra}".rstrip())
-            elif event.HasField("artifact_update"):
-                text = get_artifact_text(
-                    event.artifact_update.artifact, delimiter="\n"
+        try:
+            while True:
+                message = Message(
+                    role=Role.ROLE_USER,
+                    message_id=str(uuid.uuid4()),
+                    parts=[Part(text=current_text)],
+                    task_id=cur_task_id,
+                    context_id=cur_context_id,
                 )
-                if text.strip():
-                    artifacts.append(text)
+                request = SendMessageRequest(message=message)
 
-        await client.close()
+                question = None  # nếu server cần input (HITL), lưu câu hỏi ở đây
+                async for event in client.send_message(
+                    request, context=ClientCallContext(timeout=300.0)
+                ):
+                    if event.HasField("task"):
+                        cur_task_id = event.task.id
+                        cur_context_id = event.task.context_id
+                    elif event.HasField("status_update"):
+                        su = event.status_update
+                        if su.task_id:
+                            cur_task_id = su.task_id
+                        if su.context_id:
+                            cur_context_id = su.context_id
+                        state = TaskState.Name(su.status.state)
+                        extra = ""
+                        if su.status.HasField("message"):
+                            extra = get_message_text(
+                                su.status.message, delimiter=" "
+                            )
+                        if verbose:
+                            print(f"      [status] {state} {extra}".rstrip())
+                        if state == "TASK_STATE_INPUT_REQUIRED":
+                            question = extra
+                    elif event.HasField("artifact_update"):
+                        text = get_artifact_text(
+                            event.artifact_update.artifact, delimiter="\n"
+                        )
+                        if text.strip():
+                            artifacts.append(text)
+
+                if question is None:
+                    break  # task đã kết thúc -> thoát vòng lặp
+
+                # ---- Server đang cần người dùng (HITL) ----
+                if ask_user is None:
+                    # Không có cách hỏi người dùng -> trả "dấu hiệu HITL"
+                    # kèm id của task để bên gọi tiếp tục sau khi có câu trả lời.
+                    return (
+                        f"{HITL_PREFIX}{cur_task_id}|{cur_context_id}|{question}"
+                    )
+                # Hỏi người dùng rồi gửi câu trả lời lại cho CÙNG task.
+                # ask_user có thể là hàm thường (trả về str) hoặc async (coroutine).
+                reply = ask_user(question)
+                if asyncio.iscoroutine(reply):
+                    reply = await reply
+                current_text = reply
+        finally:
+            await client.close()
     return "\n".join(artifacts)
 
 

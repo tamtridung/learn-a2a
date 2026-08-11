@@ -1,6 +1,11 @@
-"""Orchestrator Agent - điều phối 3 worker agents qua giao thức A2A.
+"""Orchestrator Agent - điều phối các worker agents qua giao thức A2A.
 
 Vừa là A2A Server (nhận yêu cầu từ User) vừa là A2A Client (gọi worker).
+Hỗ trợ HUMAN-IN-THE-LOOP (HITL) DẠNG VÒNG LẶP: nếu một worker (vd Booking Agent)
+cần người dùng xác nhận, orchestrator chuyển tiếp câu hỏi lên người dùng bằng
+trạng thái input-required. Mỗi lần người dùng trả lời CHƯA xác nhận, worker hỏi
+lại -> orchestrator LẠI chuyển tiếp câu hỏi mới lên người dùng... lặp cho tới khi
+người dùng xác nhận thật sự và worker hoàn tất.
 """
 import argparse
 import logging
@@ -33,14 +38,15 @@ from a2a.types import (
     TaskStatus,
 )
 
-from a2a_common import call_agent, get_model, run_deep_agent
+from a2a_common import HITL_PREFIX, call_agent, get_model, run_deep_agent
 
 logger = logging.getLogger(__name__)
 
-# Địa chỉ 3 worker (có thể đổi qua biến môi trường)
+# Địa chỉ 4 worker (có thể đổi qua biến môi trường)
 WEATHER_URL = os.environ.get("A2A_WEATHER_URL", "http://127.0.0.1:41251")
 NEWS_URL = os.environ.get("A2A_NEWS_URL", "http://127.0.0.1:41252")
 CURRENCY_URL = os.environ.get("A2A_CURRENCY_URL", "http://127.0.0.1:41253")
+BOOKING_URL = os.environ.get("A2A_BOOKING_URL", "http://127.0.0.1:41254")
 
 
 def build_deep_agent():
@@ -68,16 +74,25 @@ def build_deep_agent():
         """Gửi câu hỏi về chuyển đổi tiền tệ cho Currency Agent."""
         return await call_agent(CURRENCY_URL, query, verbose=False)
 
+    @tool
+    async def ask_booking(query: str) -> str:
+        """Gửi yêu cầu đặt vé máy bay cho Booking Agent."""
+        return await call_agent(BOOKING_URL, query, verbose=False)
+
     return create_deep_agent(
         name="orchestrator",
         model=model,
-        tools=[ask_weather, ask_news, ask_currency],
+        tools=[ask_weather, ask_news, ask_currency, ask_booking],
         system_prompt=(
             "Bạn là đội trưởng điều phối. Quy tắc:\n"
             "- Hỏi về thời tiết -> gọi ask_weather\n"
             "- Hỏi về tin tức -> gọi ask_news\n"
             "- Hỏi về tiền tệ/đổi tiền -> gọi ask_currency\n"
+            "- Hỏi về đặt vé máy bay -> gọi ask_booking\n"
             "- Yêu cầu phức tạp -> gọi NHIỀU tool và tổng hợp.\n"
+            "- Nếu một tool trả về chuỗi bắt đầu bằng "
+            f"'{HITL_PREFIX}', hãy trả lời NGUYÊN VĂN chuỗi đó làm câu "
+            "trả lời cuối cùng, KHÔNG thêm, bớt hay diễn giải gì cả.\n"
             "Cuối cùng hãy trả lời rõ ràng, thân thiện bằng tiếng Việt."
         ),
     )
@@ -86,12 +101,48 @@ def build_deep_agent():
 class OrchestratorExecutor(AgentExecutor):
     def __init__(self, agent):
         self.agent = agent
+        # task_id (của orchestrator) -> thông tin worker đang chờ xác nhận (HITL)
+        self.pending = {}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue):
         user_input = context.get_user_input()
         task_id = context.task_id
         context_id = context.context_id
+        updater = TaskUpdater(event_queue, task_id, context_id)
 
+        # ============ LẦN GỌI THỨ 2+ (RESUME): người dùng vừa trả lời ============
+        if task_id in self.pending:
+            worker_url, w_task_id, w_ctx_id = self.pending.pop(task_id)
+            await updater.start_work(
+                message=updater.new_agent_message(
+                    parts=[Part(text="Đang chuyển câu trả lời của bạn tới chuyên gia...")]
+                )
+            )
+            # Chuyển câu trả lời xuống CÙNG task của worker để worker tiếp tục
+            result = await call_agent(
+                worker_url, user_input, verbose=False,
+                task_id=w_task_id, context_id=w_ctx_id,
+            )
+
+            # Worker vẫn cần hỏi thêm (HITL lặp) -> chuyển tiếp câu hỏi mới
+            # lên người dùng và tiếp tục chờ (vòng lặp) cho tới khi hoàn tất.
+            if isinstance(result, str) and result.startswith(HITL_PREFIX):
+                payload = result[len(HITL_PREFIX):].strip()
+                w_task_id, w_ctx_id, question = payload.split("|", 2)
+                self.pending[task_id] = (worker_url, w_task_id, w_ctx_id)
+                await updater.requires_input(
+                    message=updater.new_agent_message(parts=[Part(text=question)])
+                )
+                return
+
+            # Worker đã hoàn tất -> trả kết quả cuối
+            await updater.add_artifact(
+                parts=[Part(text=result)], name="response", last_chunk=True
+            )
+            await updater.complete()
+            return
+
+        # ============ LẦN GỌI ĐẦU: chạy DeepAgent để chọn worker ============
         # BẮT BUỘC: gửi Task ban đầu (submitted) TRƯỚC các status update
         await event_queue.enqueue_event(
             Task(
@@ -102,7 +153,6 @@ class OrchestratorExecutor(AgentExecutor):
             )
         )
 
-        updater = TaskUpdater(event_queue, task_id, context_id)
         await updater.start_work(
             message=updater.new_agent_message(
                 parts=[Part(text="Đang điều phối các chuyên gia...")]
@@ -110,33 +160,22 @@ class OrchestratorExecutor(AgentExecutor):
         )
 
         answer = await run_deep_agent(self.agent, user_input, thread_id=task_id)
+
+        # Một worker (vd Booking Agent) cần người dùng xác nhận: DeepAgent trả
+        # về đúng "dấu hiệu HITL" -> orchestrator chuyển task sang input-required.
+        if isinstance(answer, str) and answer.startswith(HITL_PREFIX):
+            payload = answer[len(HITL_PREFIX):].strip()
+            w_task_id, w_ctx_id, question = payload.split("|", 2)
+            self.pending[task_id] = (BOOKING_URL, w_task_id, w_ctx_id)
+            await updater.requires_input(
+                message=updater.new_agent_message(parts=[Part(text=question)])
+            )
+            return  # nhường quyền: chờ người dùng trả lời ở lần gọi sau
+
         await updater.add_artifact(
             parts=[Part(text=answer)], name="response", last_chunk=True
         )
         await updater.complete()
-
-    # async def mock_orchestrate(self, query: str) -> str:
-    #     """Mock brain: vẫn THỰC SỰ gọi các worker qua A2A (chỉ thiếu phần "suy luận")."""
-    #     q = query.lower()
-    #     tasks = []
-    #     if any(w in q for w in ["thời tiết", "weather", "nhiệt độ", "trời"]):
-    #         tasks.append(("Weather", WEATHER_URL))
-    #     if any(w in q for w in ["tin tức", "news", "bản tin"]):
-    #         tasks.append(("News", NEWS_URL))
-    #     if any(w in q for w in ["tiền", "đổi", "usd", "vnd", "eur", "gbp", "jpy", "giá"]):
-    #         tasks.append(("Currency", CURRENCY_URL))
-
-    #     if not tasks:
-    #         return (
-    #             "Tôi là orchestrator. Tôi có thể giúp bạn về: thời tiết, tin tức, "
-    #             "chuyển đổi tiền tệ. Hãy thử hỏi: 'Thời tiết Hà Nội thế nào?'"
-    #         )
-
-    #     results = []
-    #     for name, url in tasks:
-    #         result = await call_agent(url, query, verbose=False)
-    #         results.append(f"[{name}]\n{result}")
-    #     return "\n\n".join(results)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue):
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
@@ -146,7 +185,7 @@ class OrchestratorExecutor(AgentExecutor):
 def create_app(host: str, port: int):
     agent_card = AgentCard(
         name="Orchestrator Agent",
-        description="Điều phối viên: nghe yêu cầu, gọi các chuyên gia (weather/news/currency) và tổng hợp.",
+        description="Điều phối viên: nghe yêu cầu, gọi các chuyên gia (weather/news/currency/booking) và tổng hợp.",
         provider=AgentProvider(organization="A2A Course", url="http://example.com"),
         version="1.0.0",
         capabilities=AgentCapabilities(streaming=True, push_notifications=False),
