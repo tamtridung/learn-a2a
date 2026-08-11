@@ -1,5 +1,0 @@
-INFO:     Started server process [23692]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:41252 (Press CTRL+C to quit)
-INFO:     127.0.0.1:54073 - "GET /.well-known/agent-card.json HTTP/1.1" 200 OK

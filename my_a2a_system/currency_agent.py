@@ -105,15 +105,6 @@ class CurrencyExecutor(AgentExecutor):
         )
         await updater.complete()
 
-    def mock_brain(self, query: str) -> str:
-        """Mock brain: bóc tách "số tiền + đơn vị" đơn giản bằng regex."""
-        m = re.search(r"(\d+)\s*(usd|vnd|eur|euro|gbp|jpy)", query.lower())
-        if m:
-            amount = float(m.group(1))
-            ccy = m.group(2).upper()
-            return f"[MOCK currency] {amount:,.0f} {ccy} = {amount * RATES[ccy]:,.0f} VND (tỷ giá giả lập)."
-        return "[MOCK currency] Ví dụ: hãy hỏi 'đổi 100 USD sang VND'."
-
     async def cancel(self, context: RequestContext, event_queue: EventQueue):
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
         await updater.cancel()

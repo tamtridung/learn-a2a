@@ -6,7 +6,7 @@ import uuid
 
 import httpx
 
-from a2a.client import ClientConfig, create_client
+from a2a.client import ClientCallContext, ClientConfig, create_client
 from a2a.helpers import get_artifact_text, get_message_text
 from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
 
@@ -88,8 +88,12 @@ async def call_agent(base_url, user_text, verbose=True):
         )
         request = SendMessageRequest(message=message)
 
-        # Duyệt qua từng sự kiện server gửi về (stream)
-        async for event in client.send_message(request):
+        # Duyệt qua từng sự kiện server gửi về (stream).
+        # Truyền ClientCallContext(timeout=...) để tránh ReadTimeout
+        # (mặc định httpx 5s) khi server chạy LLM thật hoặc điều phối nhiều worker.
+        async for event in client.send_message(
+            request, context=ClientCallContext(timeout=300.0)
+        ):
             if event.HasField("status_update"):
                 state = TaskState.Name(event.status_update.status.state)
                 extra = ""
