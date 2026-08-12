@@ -3,20 +3,25 @@
 Booking Agent có "bộ não" là DeepAgent THẬT (DeepSeek) để:
   - Hiểu yêu cầu đặt vé bằng ngôn ngữ tự nhiên.
   - Gọi tool prepare_booking để lấy giá vé.
+  - PHÂN LOẠI yêu cầu: chỉ HITL khi THẬT SỰ cần xác nhận (hành động tốn tiền),
+    còn hỏi thông tin (giá vé, chặng bay...) thì trả lời trực tiếp.
   - SOẠN câu hỏi xác nhận cho người dùng.
+
+LINH HOẠT - HITL CHỈ KHI CẦN (không phải lúc nào cũng hỏi ở lượt đầu):
+  0. Lần gọi 1: DeepAgent phân loại yêu cầu:
+     - Chỉ HỎI THÔNG TIN (giá vé, chặng bay, lịch bay...) -> trả lời bình thường
+       + complete(), KHÔNG cần người dùng xác nhận (không HITL).
+     - ĐẶT VÉ (hành động tốn tiền) -> trả về "<CONFIRM_PREFIX><câu hỏi xác nhận>"
+       -> publish `requires_input(...)` rồi TRẢ VỀ (nhường quyền cho người dùng).
+  1. Lần gọi 2+ (resume, cùng task_id): đọc câu trả lời.
+     - Xác nhận -> complete() (đặt vé).
+     - Chưa xác nhận -> chạy DeepAgent (với checkpointer nhớ cả hội thoại) để
+       soạn câu hỏi TIẾP THEO, gọi requires_input(...) và TRẢ VỀ -> LẶP LẠI.
 
 Câu trả lời của người dùng cũng được hiểu BẰNG LLM (KHÔNG hardcode từ khoá):
   - 'ok', 'okie', 'chốt', 'chắc chắn rồi', 'yes please'... -> ĐỒNG Ý -> đặt vé.
   - Các câu trả lời khác -> agent HỎI LẠI (vòng lặp) cho tới khi người dùng xác nhận thật sự.
   Nếu chưa có API key, dùng fallback nhận diện từ khoá (mock).
-
-VÒNG LẶP HITL (lặp lại nhiều lần, không chỉ 1 lần):
-  1. Lần gọi 1: chạy DeepAgent để soạn câu hỏi, publish `requires_input(...)`
-     rồi TRẢ VỀ (nhường quyền cho người dùng).
-  2. Lần gọi 2+ (resume, cùng task_id): đọc câu trả lời.
-     - Xác nhận -> complete() (đặt vé).
-     - Chưa xác nhận -> chạy DeepAgent (với checkpointer nhớ cả hội thoại) để
-       soạn câu hỏi TIẾP THEO, gọi requires_input(...) và TRẢ VỀ -> LẶP LẠI.
 """
 import argparse
 import logging
@@ -52,6 +57,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from a2a_common import get_model, run_deep_agent
 
 logger = logging.getLogger(__name__)
+
+# Tiền tố đánh dấu "yêu cầu này cần người dùng xác nhận (HITL)".
+# LLM chỉ thêm tiền tố này khi yêu cầu là HÀNH ĐỘNG tốn tiền (đặt vé);
+# khi chỉ hỏi thông tin (giá vé, chặng bay...) thì KHÔNG thêm -> trả lời luôn.
+CONFIRM_PREFIX = "__NEED_CONFIRM__::"
+
+# Câu hỏi xác nhận mặc định (phòng thủ khi LLM trả về trống sau tiền tố)
+DEFAULT_QUESTION = (
+    "Bạn xác nhận đặt vé máy bay? (trả lời 'có' hoặc 'không')"
+)
 
 # Giá vé giả lập (VND) cho từng cặp chặng bay
 FLIGHT_PRICES = {
@@ -104,13 +119,19 @@ def build_deep_agent(model=None):
         tools=[prepare_booking],
         system_prompt=(
             "Bạn là chuyên gia đặt vé máy bay.\n"
-            "Khi nhận yêu cầu đặt vé:\n"
-            "1. Trích 'nơi đi' và 'nơi đến' từ yêu cầu, rồi gọi tool "
-            "prepare_booking để lấy giá vé.\n"
-            "2. Trả lời ĐÚNG MỘT câu hỏi xác nhận ngắn gọn, ví dụ:\n"
-            "   'Bạn xác nhận đặt vé Hà Nội → Đà Nẵng giá 1,500,000 VND? (có/không)'\n"
+            "PHÂN LOẠI yêu cầu của người dùng trước khi trả lời:\n"
+            "1. Nếu chỉ HỎI THÔNG TIN (giá vé, chặng bay, lịch bay, so sánh giá...) -> "
+            "trả lời trực tiếp bằng tiếng Việt, KHÔNG cần xác nhận, "
+            f"KHÔNG thêm tiền tố '{CONFIRM_PREFIX}'.\n"
+            "2. Nếu yêu cầu ĐẶT VÉ (đặt/book/order/mua vé — hành động tốn tiền) -> "
+            "trích 'nơi đi' và 'nơi đến', gọi tool prepare_booking để lấy giá vé, "
+            "rồi trả lời ĐÚNG MỘT câu hỏi xác nhận ngắn gọn BẮT ĐẦU BẰNG "
+            f"'{CONFIRM_PREFIX}', ví dụ:\n"
+            f"   '{CONFIRM_PREFIX}Bạn xác nhận đặt vé Hà Nội → Đà Nẵng giá 1,500,000 VND? (có/không)'\n"
+            f"CHỈ thêm tiền tố '{CONFIRM_PREFIX}' khi THẬT SỰ cần người dùng xác nhận "
+            "(đặt vé = tốn tiền).\n"
             "KHÔNG tự ý xác nhận vé. Nếu người dùng chưa đồng ý (trả lời khác 'có'), "
-            "hãy HỎI LẠI hoặc hướng dẫn theo ngữ cảnh, KHÔNG kết thúc đặt vé."
+            "hãy HỎI LẠI theo ngữ cảnh, KHÔNG kết thúc đặt vé."
         ),
         checkpointer=InMemorySaver()
     )
@@ -136,7 +157,7 @@ class BookingExecutor(AgentExecutor):
     """Bộ não xử lý. `pending` nhớ các task đang chờ người dùng xác nhận."""
 
     def __init__(self, agent, llm=None):
-        self.agent = agent   # DeepAgent: soạn câu hỏi xác nhận (có checkpointer -> nhớ hội thoại)
+        self.agent = agent   # DeepAgent: phân loại & soạn câu hỏi xác nhận (có checkpointer -> nhớ hội thoại)
         self.llm = llm       # LLM thường: hiểu câu trả lời của người dùng
         self.pending = {}    # task_id -> True (đang chờ xác nhận)
 
@@ -146,7 +167,7 @@ class BookingExecutor(AgentExecutor):
         user_input = context.get_user_input()
         updater = TaskUpdater(event_queue, task_id, context_id)
 
-        # ============ LẦN GỌI ĐẦU: soạn câu hỏi xác nhận ============
+        # ============ LẦN GỌI ĐẦU: LLM quyết định có cần xác nhận hay không ============
         if task_id not in self.pending:
             # BẮT BUỘC: gửi Task (submitted) TRƯỚC các status update
             await event_queue.enqueue_event(
@@ -160,20 +181,31 @@ class BookingExecutor(AgentExecutor):
 
             await updater.start_work(
                 message=updater.new_agent_message(
-                    parts=[Part(text="Đang lên vé, vui lòng chờ...")]
+                    parts=[Part(text="Đang xử lý yêu cầu...")]
                 )
             )
 
-            # Suy nghĩ: DeepAgent thật (LLM) HOẶC mock brain nếu không có API key
-            question = await run_deep_agent(
+            # DeepAgent phân loại yêu cầu:
+            #  - Hỏi thông tin (giá vé, chặng bay...) -> trả lời bình thường, KHÔNG HITL.
+            #  - Đặt vé (hành động tốn tiền) -> trả về "<CONFIRM_PREFIX><câu hỏi>".
+            answer = (await run_deep_agent(
                 self.agent, user_input, thread_id=task_id
-            )
+            )).strip()
 
-            # Phòng thủ: nếu LLM trả về trống/quá dài -> dùng câu hỏi mặc định
-            if not question.strip() or len(question) > 500:
-                question = (
-                    "Bạn xác nhận đặt vé máy bay? (trả lời 'có' hoặc 'không')"
+            # Trường hợp 1: KHÔNG cần xác nhận -> trả lời bình thường, complete().
+            if not answer.startswith(CONFIRM_PREFIX):
+                await updater.add_artifact(
+                    parts=[Part(text=answer)],
+                    name="response",
+                    last_chunk=True,
                 )
+                await updater.complete()
+                return
+
+            # Trường hợp 2: CẦN xác nhận -> bỏ tiền tố, lấy câu hỏi, sang HITL.
+            question = answer[len(CONFIRM_PREFIX):].strip()
+            if not question:  # phòng thủ: LLM trả về trống sau tiền tố
+                question = DEFAULT_QUESTION
 
             self.pending[task_id] = True
             # HITL: chuyển task sang input-required và TRẢ VỀ (nhường quyền).
@@ -185,7 +217,6 @@ class BookingExecutor(AgentExecutor):
 
         # ============ LẦN GỌI THỨ 2+: vòng lặp xác nhận ============
         self.pending.pop(task_id)
-
         # Hiểu ý người dùng BẰNG LLM (flexible: 'okie', 'chốt'... đều bắt được).
         confirmed = await self._is_confirmed(user_input)
 
@@ -220,7 +251,12 @@ class BookingExecutor(AgentExecutor):
                     "Bạn vẫn muốn đặt vé chứ? Nếu có, hãy trả lời 'có' để tôi đặt. "
                     "Nếu muốn đổi chặng, hãy nói rõ nơi đi và nơi đến nhé!"
                 )
-            if not reply.strip():
+            reply = reply.strip()
+            # Đã chắc chắn "chưa xác nhận" -> luôn cần hỏi lại, nên bỏ tiền tố
+            # (nếu LLM vẫn thêm) và dùng phần còn lại làm câu hỏi.
+            if reply.startswith(CONFIRM_PREFIX):
+                reply = reply[len(CONFIRM_PREFIX):].strip()
+            if not reply:
                 reply = (
                     "Bạn vẫn muốn đặt vé chứ? Nếu có, hãy trả lời 'có' để tôi đặt nhé!"
                 )
@@ -283,7 +319,7 @@ def create_app(host: str, port: int):
 
     agent_card = AgentCard(
         name="Booking Agent",
-        description="Chuyên gia đặt vé máy bay (LLM): luôn hỏi người dùng xác nhận trước khi đặt (HITL).",
+        description="Chuyên gia đặt vé máy bay (LLM): hỏi người dùng xác nhận (HITL) chỉ khi cần đặt vé tốn tiền.",
         provider=AgentProvider(organization="A2A Course", url="http://example.com"),
         version="1.0.0",
         capabilities=AgentCapabilities(streaming=True, push_notifications=False),
@@ -293,7 +329,7 @@ def create_app(host: str, port: int):
             AgentSkill(
                 id="booking",
                 name="Flight booking with confirmation",
-                description="Đặt vé máy bay; yêu cầu người dùng xác nhận (input-required).",
+                description="Đặt vé máy bay; yêu cầu người dùng xác nhận (input-required) khi cần.",
                 tags=["booking", "hitl"],
                 examples=["Đặt vé Hà Nội đi Đà Nẵng"],
                 input_modes=["text"],
